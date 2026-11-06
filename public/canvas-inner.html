@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!-- Canvas inner for agent-docs: same CSP + lockdown as src/canvas/csp.js.
+     This file is self-contained, so its CSP/lockdown are in the file
+     itself, not injected. postMessage is not network, so window.canvas
+     still works under connect-src 'none'. The lockdown + bridge scripts
+     below are synced from src/canvas/csp.js by scripts/sync-bridge.mjs
+     — edit the constants, not this file. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; media-src 'none'; font-src 'none'; connect-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; form-action 'none'; base-uri 'none'; manifest-src 'none'" />
+<title>Canvas inner — agent-docs</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 18px; color: #111; }
+  button { padding: 6px 12px; margin-right: 8px; cursor: pointer; }
+  input { padding: 5px 8px; margin-right: 8px; }
+  .muted { color: #666; font-size: 13px; }
+  pre { background: #f5f5f5; padding: 10px; white-space: pre-wrap; }
+</style>
+<!-- canvas-lockdown:start -->
+<script>
+(function () {
+  function blocked(name) {
+    return function () { throw new Error('Canvas inner shell: ' + name + ' is blocked. Use window.canvas.* via the outer shell.'); };
+  }
+  function lock(obj, prop, value) {
+    try { Object.defineProperty(obj, prop, { value: value, writable: false, configurable: false }); }
+    catch (e) { try { obj[prop] = value; } catch (_) {} }
+  }
+  lock(window, 'fetch', blocked('fetch'));
+  lock(window, 'XMLHttpRequest', blocked('XMLHttpRequest'));
+  lock(window, 'WebSocket', blocked('WebSocket'));
+  lock(window, 'EventSource', blocked('EventSource'));
+  lock(window, 'Worker', blocked('Worker'));
+  lock(window, 'SharedWorker', blocked('SharedWorker'));
+  lock(window, 'open', blocked('window.open'));
+  try { lock(Navigator.prototype, 'sendBeacon', blocked('sendBeacon')); } catch (e) {}
+  var origCreate = Document.prototype.createElement;
+  Document.prototype.createElement = function (tag) {
+    var t = String(tag || '').toLowerCase();
+    if (t === 'iframe' || t === 'object' || t === 'embed' || t === 'frame') {
+      throw new Error('Canvas inner shell: <' + t + '> is blocked.');
+    }
+    return origCreate.apply(this, arguments);
+  };
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a') : null;
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    // blob: and data: links are local downloads, not navigation:
+    // canvas.files.save triggers a download this way, and it must
+    // not be blocked. Anything else that would navigate away is.
+    if (href.startsWith('#') || href.startsWith('blob:') || href.startsWith('data:')) return;
+    e.preventDefault(); e.stopPropagation();
+  }, true);
+  document.addEventListener('submit', function (e) { e.preventDefault(); e.stopPropagation(); }, true);
+})();
+</script>
+<!-- canvas-lockdown:end -->
+</head>
+<body>
+<h2>Canvas inner — agent-docs</h2>
+<p class="muted">No fetch here. No token here. Data, state, and files come only from <code>window.canvas</code> → the viewer chrome (outer shell).</p>
+<p>Document: <strong id="doc">waiting for outer shell…</strong></p>
+<button id="loadState">Load document state via canvas.state</button>
+<button id="loadVersions">Load versions via canvas.api</button>
+<button id="badApi">Try forbidden API path</button>
+<button id="direct">Try direct fetch (should fail)</button>
+<p><label>State key <input id="key" value="canvas-demo" /></label>
+<label>Value (JSON or text) <input id="value" value="hello" /></label>
+<button id="setState">Set via canvas.state</button></p>
+<p><label>Registered API <input id="apiName" value="reports" size="10" /></label>
+<label>Upload path <input id="uploadPath" value="/upload" size="12" /></label>
+<input id="fileInput" type="file" />
+<button id="uploadFile">Upload via canvas.files</button></p>
+<p><label>Download path <input id="downloadPath" value="/reports/q3.csv" size="18" /></label>
+<button id="downloadFile">Download via canvas.files</button></p>
+<p id="status" class="muted"></p>
+<pre id="out"></pre>
+<!-- canvas-bridge:start -->
+<script>
+(function () {
+  var pending = {};
+  var subs = {};
+  var downloads = {};
+  var nextId = 1;
+  var docId = null;
+  var session = null;
+  var readyResolve = null;
+  var ready = new Promise(function (res) { readyResolve = res; });
+  var CHUNK = 1024 * 1024;
+  function notInViewer() {
+    return Promise.reject(new Error('canvas bridge: not running inside the Canvas viewer'));
+  }
+  function request(kind, extra) {
+    if (window.parent === window) return notInViewer();
+    return ready.then(function () {
+      return new Promise(function (resolve, reject) {
+        var id = nextId++;
+        pending[id] = { resolve: resolve, reject: reject };
+        window.parent.postMessage(Object.assign({ type: 'canvas-request', id: id, kind: kind, session: session }, extra), '*');
+      });
+    });
+  }
+  function requestChunk(kind, extra, buffer) {
+    if (window.parent === window) return notInViewer();
+    return ready.then(function () {
+      return new Promise(function (resolve, reject) {
+        var id = nextId++;
+        pending[id] = { resolve: resolve, reject: reject };
+        var msg = Object.assign({ type: 'canvas-request', id: id, kind: kind, session: session }, extra);
+        if (buffer) window.parent.postMessage(msg, '*', [buffer]);
+        else window.parent.postMessage(msg, '*');
+      });
+    });
+  }
+  window.addEventListener('message', function (e) {
+    var d = e.data || {};
+    if (d.type === 'canvas-init') {
+      docId = d.docId; session = d.session || null;
+      if (readyResolve) { readyResolve(); readyResolve = null; }
+      return;
+    }
+    if (d.type === 'canvas-response' && pending[d.id]) {
+      var p = pending[d.id]; delete pending[d.id];
+      if (d.ok) p.resolve(d.value); else p.reject(new Error(d.error || 'canvas error'));
+    }
+    if (d.type === 'canvas-download-chunk' && downloads[d.id]) {
+      var dl = downloads[d.id];
+      if (d.error) { delete downloads[d.id]; dl.reject(new Error(d.error)); return; }
+      if (d.data) dl.chunks.push(d.data);
+      if (d.meta) dl.meta = d.meta;
+      if (d.done) {
+        delete downloads[d.id];
+        var blob = new Blob(dl.chunks, { type: (dl.meta && dl.meta.contentType) || 'application/octet-stream' });
+        blob.name = (dl.meta && dl.meta.filename) || 'download';
+        dl.resolve(blob);
+      }
+    }
+    if (d.type === 'canvas-state-changed' && subs[d.key]) {
+      subs[d.key].forEach(function (cb) { cb(d.value); });
+    }
+  });
+  function uploadFile(args) {
+    var file = args.file;
+    // Only what the upload actually uses: slice() + size. A real
+    // File/Blob has arrayBuffer too, but the code calls it on the
+    // slice result, so a Blob-like with slice() is enough.
+    if (!file || typeof file.slice !== 'function' || typeof file.size !== 'number') {
+      return Promise.reject(new Error('canvas.files.upload needs a File or Blob'));
+    }
+    var total = file.size;
+    var uploadId = 'up_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e9).toString(36);
+    return request('files:upload:start', { uploadId: uploadId, api: args.api, path: args.path, field: args.field, filename: file.name || 'upload', size: total, type: file.type || '' })
+      .then(function (start) {
+        var size = start.chunkSize || CHUNK;
+        var chunks = start.chunks;
+        var sent = 0;
+        var chain = Promise.resolve();
+        for (var i = 0; i < chunks; i++) {
+          (function (index) {
+            chain = chain.then(function () {
+              var s = index * size;
+              return file.slice(s, Math.min(s + size, total)).arrayBuffer().then(function (buf) {
+                return requestChunk('files:upload:chunk', { uploadId: uploadId, index: index }, buf).then(function () {
+                  sent += buf.byteLength;
+                  if (args.onProgress) args.onProgress({ sent: sent, total: total, chunks: chunks, index: index });
+                });
+              });
+            });
+          })(i);
+        }
+        return chain.then(function () {
+          return request('files:upload:finish', { uploadId: uploadId });
+        });
+      });
+  }
+  function downloadFile(args) {
+    if (window.parent === window) return notInViewer();
+    return ready.then(function () {
+      return new Promise(function (resolve, reject) {
+        var id = nextId++;
+        downloads[id] = { chunks: [], meta: null, resolve: resolve, reject: reject };
+        window.parent.postMessage({ type: 'canvas-request', id: id, kind: 'files:download', session: session, api: args.api, path: args.path, params: args.params || null }, '*');
+      });
+    });
+  }
+  window.canvas = {
+    docId: function () { return docId; },
+    api: {
+      get: function (path) { return request('api', { method: 'GET', path: path }); },
+      fetch: function (api, path, opts) {
+        opts = opts || {};
+        return request('api:fetch', { api: api, path: path, method: opts.method || 'GET', body: opts.body === undefined ? null : opts.body });
+      },
+    },
+    state: {
+      get: function (key) { return request('state:get', { key: key }); },
+      all: function () { return request('state:all'); },
+      set: function (key, value) { return request('state:set', { key: key, value: value }); },
+      delete: function (key) { return request('state:delete', { key: key }); },
+      subscribe: function (key, cb) {
+        (subs[key] = subs[key] || []).push(cb);
+        return Promise.resolve(true);
+      },
+    },
+    files: {
+      upload: uploadFile,
+      download: downloadFile,
+      save: function (args) {
+        return downloadFile(args).then(function (blob) {
+          var filename = args.filename || blob.name || 'download';
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          return { filename: filename, size: blob.size };
+        });
+      },
+    },
+  };
+})();
+</script>
+<!-- canvas-bridge:end -->
+<script>
+  (function () {
+    var statusEl = document.getElementById('status');
+    var outEl = document.getElementById('out');
+    function show(label, v) { statusEl.textContent = label; outEl.textContent = JSON.stringify(v, null, 2); }
+    function loadState() {
+      window.canvas.state.all().then(function (s) { show('Document state (via outer shell):', s); })
+        .catch(function (e) { statusEl.textContent = 'Error: ' + e.message; });
+    }
+    window.addEventListener('message', function (e) {
+      var d = e.data || {};
+      if (d.type === 'canvas-init') {
+        document.getElementById('doc').textContent = d.docId || '(none)';
+        loadState();
+      }
+    });
+    document.getElementById('loadState').onclick = loadState;
+    document.getElementById('loadVersions').onclick = function () {
+      var docId = window.canvas.docId();
+      if (!docId) { statusEl.textContent = 'No document selected.'; return; }
+      window.canvas.api.get('/v1/documents/' + docId + '/versions').then(function (v) { show('Versions (via outer shell):', v); })
+        .catch(function (e) { statusEl.textContent = 'Error: ' + e.message; });
+    };
+    document.getElementById('badApi').onclick = function () {
+      var docId = window.canvas.docId();
+      window.canvas.api.get('/v1/documents/' + docId + '/draft/publish').then(function () { statusEl.textContent = 'Unexpected success'; })
+        .catch(function (e) { statusEl.textContent = 'Blocked as expected: ' + e.message + ' (outer never fetched it)'; });
+    };
+    document.getElementById('direct').onclick = function () {
+      try {
+        var p = fetch('https://example.com/');
+        if (p && p.then) p.catch(function (e) { statusEl.textContent = 'Direct fetch blocked: ' + e.message; });
+        else statusEl.textContent = 'Direct fetch blocked (no promise returned)';
+      } catch (e) { statusEl.textContent = 'Direct fetch blocked: ' + e.message; }
+    };
+    document.getElementById('setState').onclick = function () {
+      var k = document.getElementById('key').value;
+      var raw = document.getElementById('value').value;
+      var v; try { v = JSON.parse(raw); } catch (e) { v = raw; }
+      window.canvas.state.set(k, v).then(loadState).catch(function (e) { statusEl.textContent = 'Error: ' + e.message; });
+    };
+    document.getElementById('uploadFile').onclick = function () {
+      var f = document.getElementById('fileInput').files[0];
+      if (!f) { statusEl.textContent = 'Pick a file first.'; return; }
+      var api = document.getElementById('apiName').value;
+      var path = document.getElementById('uploadPath').value;
+      window.canvas.files.upload({ api: api, path: path, file: f, onProgress: function (p) {
+        statusEl.textContent = 'Uploading ' + f.name + ': ' + p.sent + ' / ' + p.total + ' bytes';
+      }}).then(function (res) { show('Upload done — the registered API replied:', res); })
+        .catch(function (e) { statusEl.textContent = 'Upload failed: ' + e.message; });
+    };
+    document.getElementById('downloadFile').onclick = function () {
+      var api = document.getElementById('apiName').value;
+      var path = document.getElementById('downloadPath').value;
+      window.canvas.files.save({ api: api, path: path }).then(function (r) {
+        statusEl.textContent = 'Downloaded ' + r.filename + ' (' + r.size + ' bytes)';
+      }).catch(function (e) { statusEl.textContent = 'Download failed: ' + e.message; });
+    };
+  })();
+</script>
+</body>
+</html>
