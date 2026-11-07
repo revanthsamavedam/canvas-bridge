@@ -142,6 +142,38 @@ await assert.rejects(
 )
 assert.equal(binaryCalls, 1, 'rejected download must never fetch binary')
 
+// --- handler: download cap (25 MB default, maxDownloadBytes override) ---
+{
+  let cappedCalls = 0
+  const capped = createFilesHandler({
+    callRegisteredApi: mockCallRegisteredApi,
+    fetchBinary: async () => {
+      cappedCalls++
+      return { bytes: new Uint8Array(200), contentType: 'application/octet-stream', filename: 'big.bin' }
+    },
+    isAppRegistered: (n) => n === 'riskhub',
+    maxDownloadBytes: 100,
+  })
+  const streamed = []
+  await assert.rejects(
+    () => capped.download({ api: 'riskhub', path: '/big.bin', onChunk: (c) => streamed.push(c) }),
+    /FILE_TOO_LARGE/
+  )
+  assert.equal(streamed.length, 0, 'capped download must stream nothing')
+  assert.equal(cappedCalls, 1, 'cap is checked after fetch, before streaming')
+  // the default cap is the 25 MB upload cap
+  const big = new Uint8Array(DEFAULT_MAX_FILE_SIZE + 1)
+  const defaultCapped = createFilesHandler({
+    callRegisteredApi: mockCallRegisteredApi,
+    fetchBinary: async () => ({ bytes: big, contentType: 'application/octet-stream', filename: 'big.bin' }),
+    isAppRegistered: (n) => n === 'riskhub',
+  })
+  await assert.rejects(
+    () => defaultCapped.download({ api: 'riskhub', path: '/big.bin', onChunk: () => {} }),
+    /FILE_TOO_LARGE/
+  )
+}
+
 // --- host: api.fetch + files route through the same handler ---
 const hostCalls = []
 const host = createCanvasHost({

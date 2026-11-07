@@ -112,8 +112,12 @@ function error(message, code) {
 // fetchBinary is (api, path, params) => {bytes, contentType,
 // filename}. Neither ever hands a token to the page — they run in
 // the chrome, and only their results cross postMessage.
-export function createFilesHandler({ callRegisteredApi, fetchBinary, onLog, maxFileSize, isAppRegistered, store }) {
+export function createFilesHandler({ callRegisteredApi, fetchBinary, onLog, maxFileSize, maxDownloadBytes, isAppRegistered, store }) {
   const max = Number.isFinite(maxFileSize) ? maxFileSize : DEFAULT_MAX_FILE_SIZE;
+  // Download cap, defaulting to the upload cap (25 MB): a registered
+  // API returning a huge file must not OOM the tab by buffering it
+  // all and streaming it over postMessage.
+  const maxDownload = Number.isFinite(maxDownloadBytes) ? maxDownloadBytes : max;
   // The upload store can live outside the handler (a React ref):
   // the chrome creates a fresh handler per message with the
   // current render's registry caller, but partial uploads survive
@@ -182,6 +186,10 @@ export function createFilesHandler({ callRegisteredApi, fetchBinary, onLog, maxF
     const started = Date.now();
     const { bytes, contentType, filename } = await fetchBinary(api, path, params);
     const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    // Cap downloads like uploads: a registered API returning a huge
+    // file must not OOM the tab by buffering it all and streaming
+    // it over postMessage. Checked after fetch, before streaming.
+    if (buf.length > maxDownload) throw error(`FILE_TOO_LARGE: download of ${buf.length} bytes exceeds the ${maxDownload} byte limit`, "FILE_TOO_LARGE");
     const chunks = splitIntoChunks(buf);
     log(`files download ${api} ${path} (${buf.length} bytes)`, "ok", { ms: Date.now() - started });
     const meta = { size: buf.length, contentType: contentType || "application/octet-stream", filename: filename || path.split("/").filter(Boolean).pop() || "download" };

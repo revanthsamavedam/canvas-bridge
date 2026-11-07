@@ -132,15 +132,31 @@ export const CANVAS_BRIDGE_SCRIPT = `(function () {
     });
   }
   window.addEventListener('message', function (e) {
+    // Only the viewer chrome may talk to the page: a message from
+    // any other window (a nested frame, another tab) is ignored.
+    // The chrome is window.parent for an iframed page.
+    if (e.source !== window.parent) return;
     var d = e.data || {};
     if (d.type === 'canvas-init') {
       docId = d.docId; session = d.session || null;
       if (readyResolve) { readyResolve(); readyResolve = null; }
       return;
     }
-    if (d.type === 'canvas-response' && pending[d.id]) {
-      var p = pending[d.id]; delete pending[d.id];
-      if (d.ok) p.resolve(d.value); else p.reject(new Error(d.error || 'canvas error'));
+    if (d.type === 'canvas-response') {
+      if (pending[d.id]) {
+        var p = pending[d.id]; delete pending[d.id];
+        if (d.ok) p.resolve(d.value); else p.reject(new Error(d.error || 'canvas error'));
+      }
+      // A download registers in downloads[], not pending[], so a
+      // canvas-response error for its id (e.g. STALE_SESSION from
+      // the session check, which runs before kind dispatch) would
+      // otherwise leave the download promise hanging forever.
+      // Reject it here; an ok response for a download id is
+      // ignored — downloads resolve via canvas-download-chunk.
+      if (!d.ok && downloads[d.id]) {
+        var dl = downloads[d.id]; delete downloads[d.id];
+        dl.reject(new Error(d.error || 'canvas error'));
+      }
     }
     if (d.type === 'canvas-download-chunk' && downloads[d.id]) {
       var dl = downloads[d.id];

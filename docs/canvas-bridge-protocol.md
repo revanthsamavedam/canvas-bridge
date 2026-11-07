@@ -364,9 +364,13 @@ The rules, all enforced before any byte flows (§7.5):
 - **Upload is POST-only.** The chrome POSTs the file as
   `multipart/form-data` to the registered API. There is no PUT-upload
   in this version.
-- **25 MB cap.** `DEFAULT_MAX_FILE_SIZE` is 25 × 1024 × 1024 bytes.
-  Bigger files are rejected with `FILE_TOO_LARGE` at the start
-  message — before a single byte is sent.
+- **25 MB cap, both directions.** `DEFAULT_MAX_FILE_SIZE` is
+  25 × 1024 × 1024 bytes. Bigger uploads are rejected with
+  `FILE_TOO_LARGE` at the start message — before a single byte is
+  sent. Bigger downloads are rejected with `FILE_TOO_LARGE` too,
+  checked by the chrome after fetching and before streaming any
+  chunk — so a registered API returning a huge file cannot OOM the
+  tab.
 - **1 MB chunks.** The file is sliced into 1 MB pieces and sent one
   at a time, each acknowledged by the chrome. A 2.5 MB file is 3
   chunks; a 25 MB file is 25.
@@ -480,12 +484,20 @@ Rules of the envelope:
 - `ok: false` always comes with an `error` string, which is one of the
   codes in §7.6. The error never contains a token, a URL, or file
   content.
-- For `files:download` there is **no** `canvas-response`. Success is a
-  stream of `canvas-download-chunk` messages ending with `done: true`;
-  failure is a single `canvas-download-chunk` carrying only `error`.
+- For `files:download` there is **no** `canvas-response` on the
+  success path. Success is a stream of `canvas-download-chunk`
+  messages ending with `done: true`; failure is a single
+  `canvas-download-chunk` carrying only `error`. One exception: a
+  `canvas-response` with `ok: false` for a download id (for example
+  `STALE_SESSION`, answered before kind dispatch) also rejects the
+  download — otherwise the promise would hang forever, because
+  downloads do not live in the pending-request table.
 - The chrome only honours messages that come from the Canvas iframe
   itself (`e.source === frame.contentWindow`). A message from any
-  other window is ignored silently.
+  other window is ignored silently. The mirror holds on the page
+  side: the bridge client only honours messages from the viewer
+  chrome (`e.source === window.parent`); a message from any other
+  window is ignored silently.
 
 ### 7.3 The five message types
 
@@ -1080,7 +1092,7 @@ deliberate rule or a known gap.
   only. There is no way to call an unregistered URL, and no
   token-URL override in the Canvas bridge.
 - **Upload is POST-only.** No PUT-upload in v2.
-- **25 MB cap on uploads**, and the blocked-extension list (§6.4).
+- **25 MB cap on uploads and downloads**, and the blocked-extension list (§6.4).
   Both are bridge limits, not API limits: raising the cap needs the
   constant changed in `files.js` *and* the receiving API to accept
   the bigger file.

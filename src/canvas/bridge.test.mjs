@@ -36,8 +36,10 @@ function makeWindow({ inViewer = true } = {}) {
   sandbox.window.window = win
   vm.createContext(sandbox)
   vm.runInContext(CANVAS_BRIDGE_SCRIPT, sandbox)
-  const deliver = (data) => {
-    for (const fn of listeners.message || []) fn({ data })
+  const deliver = (data, source) => {
+    // Delivered as if from the viewer chrome (window.parent); pass
+    // an explicit source to simulate a foreign window.
+    for (const fn of listeners.message || []) fn({ data, source: source === undefined ? win.parent : source })
   }
   return { win, sandbox, sent, deliver }
 }
@@ -160,6 +162,16 @@ const CHUNK = 1024 * 1024
   const id2 = sent[sent.length - 1].msg.id
   deliver({ type: 'canvas-download-chunk', id: id2, error: 'api_not_registered' })
   await assert.rejects(() => p2, /api_not_registered/)
+
+  // a canvas-response error for a download id rejects it too
+  // (stale session: the chrome answers STALE_SESSION as a
+  // canvas-response before kind dispatch, and downloads do not
+  // live in pending[] — without this the promise hangs forever)
+  const p3 = win.canvas.files.download({ api: 'riskhub', path: '/x' })
+  await new Promise((r) => setTimeout(r, 0))
+  const id3 = sent[sent.length - 1].msg.id
+  deliver({ type: 'canvas-response', id: id3, ok: false, error: 'STALE_SESSION' })
+  await assert.rejects(() => p3, /STALE_SESSION/)
 }
 
 // --- save(): download, then a blob: anchor click ---
@@ -190,6 +202,29 @@ const CHUNK = 1024 * 1024
   await win.canvas.state.subscribe('k', (v) => seen.push(v))
   deliver({ type: 'canvas-state-changed', key: 'k', value: 42 })
   assert.deepEqual(seen, [42])
+}
+
+// --- messages from any window other than the parent are ignored ---
+{
+  const { win, sent, deliver } = makeWindow()
+  deliver({ type: 'canvas-init', docId: 'doc_1', session: 's1' })
+  const seen = []
+  await win.canvas.state.subscribe('k', (v) => seen.push(v))
+  // a state push from a foreign window must not reach subscribers
+  deliver({ type: 'canvas-state-changed', key: 'k', value: 99 }, {})
+  assert.deepEqual(seen, [], 'foreign-source state push must be ignored')
+  // a response from a foreign window must not settle the request
+  const p = win.canvas.api.get('/v1/documents')
+  await new Promise((r) => setTimeout(r, 0))
+  const id = sent[sent.length - 1].msg.id
+  let settled = false
+  p.then(() => { settled = true }, () => { settled = true })
+  deliver({ type: 'canvas-response', id, ok: true, value: { documents: [] } }, {})
+  await new Promise((r) => setTimeout(r, 0))
+  assert.equal(settled, false, 'foreign-source response must not settle the request')
+  // the real parent's response still settles it
+  deliver({ type: 'canvas-response', id, ok: true, value: { documents: [] } })
+  assert.deepEqual(await p, { documents: [] })
 }
 
 // --- the demo inner page stays in sync with the canonical bridge ---
